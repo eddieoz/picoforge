@@ -2,8 +2,8 @@
 //!
 //! Each public function here selects the appropriate protocol path based
 //! on the detected firmware type or an explicit [`DeviceMethod`] parameter.
-//! Some functions (e.g. `read_device_details`) try Rescue (PC/SC) first,
-//! then FIDO, and merge results to produce a complete status snapshot.
+//! Device details use FIDO GetInfo and the PC/SC Rescue identity response to
+//! identify supported firmware and pair both interfaces to the same key.
 
 use crate::{
     error::PFError,
@@ -13,43 +13,43 @@ use crate::{
     },
 };
 
-/// Which transport's firmware classification wins when both legs ran.
-///
-/// The FIDO AAGUID is authoritative (divergence D5, EPIC PF-FAPICO2): it is
-/// the sealed, compile-time identity, while the PC/SC rescue SELECT's
-/// SDK byte (`data[2] >= 8` → "RS-Key") is a protocol-capability statement —
-/// fapico2 ships an RS-Key-SDK-compatible rescue applet (`apps/rescue/src/
-/// lib.rs`, `RSKEY_SDK_MAJOR = 8`) that answers that byte without being an
-/// RS-Key. The PC/SC classification therefore fills in only when the FIDO
-/// leg is absent.
-fn merged_firmware_type(
-    fido_type: Option<FirmwareType>,
-    rescue_type: Option<FirmwareType>,
-) -> FirmwareType {
-    match (fido_type, rescue_type) {
-        (Some(fido), _) => fido,
-        (None, Some(rescue)) => rescue,
-        (None, None) => FirmwareType::Unknown,
-    }
-}
-
 /// Read full device status by merging FIDO and Rescue data where available.
 ///
-/// Tries the FIDO HID transport first, then falls back to the PC/SC
-/// rescue channel. When both succeed, fields from the more detailed
-/// source are used (e.g. serial/flash from Rescue, AAGUID from FIDO).
+/// Identifies a supported FIDO key by AAGUID where available, then validates
+/// the PC/SC Rescue response and matches both interfaces by firmware serial.
 pub fn read_device_details() -> Result<FullDeviceStatus, PFError> {
     let mut fido_status: Option<FullDeviceStatus> = None;
     let mut rescue_status: Option<FullDeviceStatus> = None;
     let mut rescue_fw_type: Option<FirmwareType> = None;
 
-    // Discover via Rescue/PC/SC transport (preferred for richer details)
+    // Start from the firmware's FIDO model identity (AAGUID), not a USB name.
+    match fido::read_device_details() {
+        Ok(status) => {
+            let supported = matches!(
+                status.firmware_type,
+                FirmwareType::RSKey | FirmwareType::PicoFido | FirmwareType::Fapico2
+            );
+            if supported {
+                crate::hal::transport::pcsc::set_active_device_serial(Some(
+                    status.info.serial.clone(),
+                ));
+            }
+            fido_status = Some(status);
+        }
+        Err(e) => log::info!("FIDO device details unavailable: {}", e),
+    }
+
+    // PC/SC readers are accepted only after the Rescue AID returns the
+    // firmware's expected product identity block; reader names only prioritize.
     match DeviceHandle::try_rescue() {
         Ok(Some((handle, _identity))) => {
             rescue_fw_type = Some(handle.firmware_type());
             match rescue::read_device_details() {
                 Ok(status) => {
                     log::info!("Rescue device details read successfully");
+                    crate::hal::transport::pcsc::set_active_device_serial(Some(
+                        status.info.serial.clone(),
+                    ));
                     rescue_status = Some(status);
                 }
                 Err(e) => log::warn!("Rescue read_device_details failed: {}", e),
@@ -59,21 +59,28 @@ pub fn read_device_details() -> Result<FullDeviceStatus, PFError> {
         Err(e) => log::warn!("Rescue PC/SC discovery error: {}", e),
     }
 
-    // Discover via FIDO/HID transport (fallback for FIDO-only details)
-    match DeviceHandle::try_fido() {
-        Ok(Some((_handle, _identity))) => match fido::read_device_details() {
-            Ok(status) => {
-                log::info!("FIDO device details read successfully");
+    // If the first enumerated HID device was unrelated, the validated PC/SC
+    // identity now lets HID locate the matching PicoFido/RS-Key interface.
+    if let Some(rescue) = rescue_status.as_ref()
+        && fido_status
+            .as_ref()
+            .is_none_or(|fido| fido.info.serial != rescue.info.serial)
+    {
+        match fido::read_device_details() {
+            Ok(status) if status.info.serial == rescue.info.serial => {
                 fido_status = Some(status);
             }
-            Err(e) => log::warn!("FIDO read_device_details failed: {}", e),
-        },
-        Ok(None) => log::info!("No FIDO HID device found"),
-        Err(e) => log::warn!("FIDO HID discovery error: {}", e),
+            Ok(status) => log::debug!(
+                "HID serial {} did not match validated PC/SC key {}",
+                status.info.serial,
+                rescue.info.serial
+            ),
+            Err(error) => log::debug!("Could not pair FIDO interface to PC/SC key: {error}"),
+        }
     }
 
     match (fido_status, rescue_status) {
-        (Some(fido), Some(rescue)) => {
+        (Some(fido), Some(rescue)) if fido.info.serial == rescue.info.serial => {
             log::info!("Merging FIDO and Rescue device details");
             Ok(FullDeviceStatus {
                 info: DeviceInfo {
@@ -139,33 +146,40 @@ pub fn read_device_details() -> Result<FullDeviceStatus, PFError> {
                 secure_boot: rescue.secure_boot,
                 secure_lock: rescue.secure_lock,
                 method: DeviceMethod::Rescue,
-                // FIDO AAGUID wins (see `merged_firmware_type`): a fapico2
-                // board's PC/SC leg reports RSKey from the rescue SDK byte,
-                // and the merged view must not report two identities.
-                firmware_type: merged_firmware_type(
-                    Some(fido.firmware_type),
-                    Some(rescue.firmware_type),
-                ),
+                firmware_type: fido.firmware_type,
             })
+        }
+        (Some(fido), Some(rescue)) => {
+            log::warn!(
+                "Refusing to merge FIDO serial {} with PC/SC serial {}",
+                fido.info.serial,
+                rescue.info.serial
+            );
+            if matches!(
+                fido.firmware_type,
+                FirmwareType::RSKey | FirmwareType::PicoFido | FirmwareType::Fapico2
+            ) {
+                Ok(fido)
+            } else {
+                let firmware_type = rescue_fw_type.unwrap_or(rescue.firmware_type.clone());
+                Ok(FullDeviceStatus {
+                    firmware_type,
+                    ..rescue
+                })
+            }
         }
         (Some(fido), None) => {
             log::info!("Using FIDO-only device details");
             Ok(FullDeviceStatus {
-                firmware_type: merged_firmware_type(Some(fido.firmware_type), None),
+                firmware_type: fido.firmware_type,
                 ..fido
             })
         }
         (None, Some(rescue)) => {
             log::info!("Using Rescue-only device details");
-            // No FIDO leg: the PC/SC classification fills in, but only over
-            // an Unknown from the rescue read itself (same rule as before).
-            let pcsc_type =
-                rescue_fw_type.filter(|_| rescue.firmware_type == FirmwareType::Unknown);
+            let ft = rescue_fw_type.filter(|_| rescue.firmware_type == FirmwareType::Unknown);
             Ok(FullDeviceStatus {
-                firmware_type: merged_firmware_type(
-                    None,
-                    Some(pcsc_type.unwrap_or(rescue.firmware_type)),
-                ),
+                firmware_type: ft.unwrap_or(rescue.firmware_type),
                 ..rescue
             })
         }
@@ -890,38 +904,4 @@ pub fn openpgp_generate(admin: String, slot: openpgp::PgpSlot, choice: u8) -> Re
 
 pub fn openpgp_reset() -> Result<(), PFError> {
     openpgp::reset(&openpgp::open()?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // US-1753 (EPIC PF-FAPICO2, divergence D5): the merge order is pinned
-    // without any HID/PC-SC IO — the FIDO AAGUID is authoritative whenever
-    // its leg ran; the PC/SC classification fills in only when it is absent.
-
-    #[test]
-    fn fido_type_wins_when_both_legs_ran() {
-        // fapico2 board: the PC/SC rescue SDK byte classifies RSKey while
-        // the FIDO AAGUID classifies Fapico2 — the merged view must not
-        // report two different firmware types.
-        let merged = merged_firmware_type(Some(FirmwareType::Fapico2), Some(FirmwareType::RSKey));
-        assert_eq!(merged, FirmwareType::Fapico2);
-    }
-
-    #[test]
-    fn rescue_type_fills_only_when_fido_absent() {
-        let merged = merged_firmware_type(None, Some(FirmwareType::RSKey));
-        assert_eq!(merged, FirmwareType::RSKey);
-    }
-
-    #[test]
-    fn unknown_when_neither_leg_classified() {
-        assert_eq!(merged_firmware_type(None, None), FirmwareType::Unknown);
-        // A FIDO Unknown is still the FIDO leg's answer: it wins.
-        assert_eq!(
-            merged_firmware_type(Some(FirmwareType::Unknown), Some(FirmwareType::RSKey)),
-            FirmwareType::Unknown
-        );
-    }
 }

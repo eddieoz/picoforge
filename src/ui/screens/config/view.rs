@@ -1,11 +1,14 @@
+use crate::hal::types::FirmwareType;
+use crate::ui::components::button::ButtonColors;
 use crate::ui::components::{card::Card, page_view::PageView};
 use crate::ui::models::device::{
     DeviceMethod, LedColor, LedStatus, USB_CAP_FIDO2, USB_CAP_OATH, USB_CAP_OPENPGP, USB_CAP_OTP,
     USB_CAP_PIV, USB_CAP_U2F,
 };
 use crate::ui::screens::config::view_model::ConfigViewModel;
-use gpui::*;
-use gpui_component::{button::*, input::*, select::*, slider::*, switch::*, *};
+use gpui_kit::component::{button::*, input::*, select::*, slider::*, switch::*, *};
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
 
 /// Per-status LED brightness is a full u8 on the device (0-255, 0 = off). The
 /// +/- steppers move in coarse steps (15 divides 255 evenly) so the whole range
@@ -87,33 +90,40 @@ impl ConfigViewModel {
         is_fido: bool,
         is_rskey: bool,
         hardware_config_disabled: bool,
+        hide_unsupported: bool,
     ) -> impl IntoElement {
         // GPIO pin + driver are the LED hardware topology — always shown.
-        let mut content = v_flex().gap_4().child(
-            div()
-                .grid()
-                .grid_cols(2)
-                .gap_4()
-                .child(
-                    v_flex().gap_2().child("LED GPIO Pin").child(
-                        Input::new(&self.led_gpio_input)
-                            .bg(rgb(0x222225))
-                            .disabled(hardware_config_disabled),
-                    ),
-                )
-                .child(
-                    v_flex().gap_2().child("LED Driver").child(
-                        Select::new(&self.led_driver_select)
-                            .w_full()
-                            .bg(rgb(0x222225))
-                            .disabled(is_fido),
-                    ),
-                ),
+        // `hide_unsupported` (fapico2) drops the driver cell: its firmware
+        // refuses a write blob carrying the driver tag.
+        let mut grid = div().grid().gap_4();
+        grid = if hide_unsupported {
+            grid.grid_cols(1)
+        } else {
+            grid.grid_cols(2)
+        };
+        grid = grid.child(
+            v_flex().gap_2().child("LED GPIO Pin").child(
+                Input::new(&self.led_gpio_input)
+                    .bg(rgb(0x222225))
+                    .disabled(hardware_config_disabled),
+            ),
         );
+        if !hide_unsupported {
+            grid = grid.child(
+                v_flex().gap_2().child("LED Driver").child(
+                    Select::new(&self.led_driver_select)
+                        .w_full()
+                        .bg(rgb(0x222225))
+                        .disabled(is_fido),
+                ),
+            );
+        }
+        let mut content = v_flex().gap_4().child(grid);
 
         // Colour order is an RS-Key extension (phy tag 0x0D); pico-fido ignores
         // it, so only surface it for RS-Key. Fixes red/green swap on GRB panels.
-        if is_rskey {
+        // fapico2 refuses the order tag, so it is hidden there too.
+        if is_rskey && !hide_unsupported {
             content = content.child(
                 v_flex().gap_2().child("LED Colour Order").child(
                     Select::new(&self.led_order_select)
@@ -329,31 +339,39 @@ impl ConfigViewModel {
                             .gap_2()
                             .items_center()
                             .child(
-                                Button::new(gpui::SharedString::from(format!("color-btn-{}", i)))
-                                    .child(color_name)
-                                    .custom(
-                                        ButtonCustomVariant::new(cx)
-                                            .color(rgb(0x27272a).into())
-                                            .hover(rgb(0x3f3f46).into())
-                                            .active(rgb(0x52525b).into())
-                                            .border(theme.border),
-                                    )
-                                    .disabled(is_fido)
-                                    .on_click(cycle_color_listener),
+                                Button::new(gpui_kit::SharedString::from(format!(
+                                    "color-btn-{}",
+                                    i
+                                )))
+                                .child(color_name)
+                                .map(|button| {
+                                    ButtonColors::new(cx)
+                                        .color(rgb(0x27272a).into())
+                                        .hover(rgb(0x3f3f46).into())
+                                        .active(rgb(0x52525b).into())
+                                        .border(theme.border)
+                                        .apply(button, is_fido, cx)
+                                })
+                                .disabled(is_fido)
+                                .on_click(cycle_color_listener),
                             )
                             .child(div().w_4())
                             .child(
-                                Button::new(gpui::SharedString::from(format!("bdec-btn-{}", i)))
-                                    .child("-")
-                                    .custom(
-                                        ButtonCustomVariant::new(cx)
-                                            .color(rgb(0x1b1b1d).into())
-                                            .hover(rgb(0x232325).into())
-                                            .active(rgb(0x3f3f46).into())
-                                            .border(theme.border),
-                                    )
-                                    .disabled(is_fido || brightness_val == 0)
-                                    .on_click(dec_bright_listener),
+                                Button::new(gpui_kit::SharedString::from(format!(
+                                    "bdec-btn-{}",
+                                    i
+                                )))
+                                .child("-")
+                                .map(|button| {
+                                    ButtonColors::new(cx)
+                                        .color(rgb(0x1b1b1d).into())
+                                        .hover(rgb(0x232325).into())
+                                        .active(rgb(0x3f3f46).into())
+                                        .border(theme.border)
+                                        .apply(button, is_fido || brightness_val == 0, cx)
+                                })
+                                .disabled(is_fido || brightness_val == 0)
+                                .on_click(dec_bright_listener),
                             )
                             .child(
                                 div()
@@ -363,17 +381,25 @@ impl ConfigViewModel {
                                     .child(brightness_val.to_string()),
                             )
                             .child(
-                                Button::new(gpui::SharedString::from(format!("binc-btn-{}", i)))
-                                    .child("+")
-                                    .custom(
-                                        ButtonCustomVariant::new(cx)
-                                            .color(rgb(0x1b1b1d).into())
-                                            .hover(rgb(0x232325).into())
-                                            .active(rgb(0x3f3f46).into())
-                                            .border(theme.border),
-                                    )
-                                    .disabled(is_fido || brightness_val == LED_BRIGHTNESS_MAX)
-                                    .on_click(inc_bright_listener),
+                                Button::new(gpui_kit::SharedString::from(format!(
+                                    "binc-btn-{}",
+                                    i
+                                )))
+                                .child("+")
+                                .map(|button| {
+                                    ButtonColors::new(cx)
+                                        .color(rgb(0x1b1b1d).into())
+                                        .hover(rgb(0x232325).into())
+                                        .active(rgb(0x3f3f46).into())
+                                        .border(theme.border)
+                                        .apply(
+                                            button,
+                                            is_fido || brightness_val == LED_BRIGHTNESS_MAX,
+                                            cx,
+                                        )
+                                })
+                                .disabled(is_fido || brightness_val == LED_BRIGHTNESS_MAX)
+                                .on_click(inc_bright_listener),
                             ),
                     ),
             );
@@ -416,12 +442,12 @@ impl ConfigViewModel {
                 cx.notify();
             });
 
-            rows =
-                rows.child(
-                    h_flex()
-                        .items_center()
-                        .justify_between()
-                        .child(v_flex().gap_0p5().child(name).child(
+            rows = rows.child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        v_flex().gap_0p5().child(name).child(
                             div().text_sm().text_color(theme.muted_foreground).child(
                                 if is_supported {
                                     "Supported"
@@ -429,14 +455,15 @@ impl ConfigViewModel {
                                     "Not Supported by Firmware"
                                 },
                             ),
-                        ))
-                        .child(
-                            Switch::new(gpui::SharedString::from(format!("app-toggle-{}", cap)))
-                                .checked(is_enabled)
-                                .disabled(is_fido || !is_supported)
-                                .on_click(toggle_listener),
                         ),
-                );
+                    )
+                    .child(
+                        Switch::new(gpui_kit::SharedString::from(format!("app-toggle-{}", cap)))
+                            .checked(is_enabled)
+                            .disabled(is_fido || !is_supported)
+                            .on_click(toggle_listener),
+                    ),
+            );
         }
 
         Card::new()
@@ -519,10 +546,13 @@ impl ConfigViewModel {
                         ),
                     )
                     .child(
-                        Switch::new(gpui::SharedString::from(format!("usb-itf-toggle-{}", bit)))
-                            .checked(is_enabled || is_ccid)
-                            .disabled(is_fido || is_ccid)
-                            .on_click(toggle_listener),
+                        Switch::new(gpui_kit::SharedString::from(format!(
+                            "usb-itf-toggle-{}",
+                            bit
+                        )))
+                        .checked(is_enabled || is_ccid)
+                        .disabled(is_fido || is_ccid)
+                        .on_click(toggle_listener),
                     ),
             );
         }
@@ -569,6 +599,12 @@ impl Render for ConfigViewModel {
         let is_rskey = status
             .as_ref()
             .is_some_and(|s| s.firmware_type.supports_rskey_vendor());
+        // fapico2 (third-party): same 0x41 dialect, but its firmware refuses
+        // a whole write blob containing the tags it has no field for — hide
+        // those controls instead of dead-ending a mixed save.
+        let is_fapico2 = status
+            .as_ref()
+            .is_some_and(|s| s.firmware_type == FirmwareType::Fapico2);
 
         let supports_legacy_fido_config = status
             .as_ref()
@@ -582,7 +618,13 @@ impl Render for ConfigViewModel {
         let is_fido_no_rskey = is_fido && !is_rskey;
 
         let led_card = self
-            .render_led_card(cx, is_fido_no_rskey, is_rskey, hardware_config_disabled)
+            .render_led_card(
+                cx,
+                is_fido_no_rskey,
+                is_rskey,
+                hardware_config_disabled,
+                is_fapico2,
+            )
             .into_any_element();
         let options_card = self
             .render_options_card(cx, hardware_config_disabled)
@@ -614,7 +656,19 @@ impl Render for ConfigViewModel {
             inner = inner.child(self.render_rskey_led_card(cx, false));
         }
 
-        inner = inner.child(touch_card).child(options_card);
+        if is_fapico2 {
+            // The touch card is dropped for fapico2 (its firmware refuses the
+            // presence-timeout tag) — say so instead of a silent gap.
+            inner = inner.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Touch timeout, curve mask, LED driver and LED order are not configurable on fapico2 firmware."),
+            );
+        } else {
+            inner = inner.child(touch_card);
+        }
+        inner = inner.child(options_card);
 
         inner = inner.child(
             h_flex().justify_end().pt_4().child(
@@ -622,13 +676,14 @@ impl Render for ConfigViewModel {
                     .icon(Icon::default().path("icons/save.svg"))
                     .child("Apply Changes")
                     .disabled(self.loading || hardware_config_disabled)
-                    .custom(
-                        ButtonCustomVariant::new(cx)
+                    .map(|button| {
+                        ButtonColors::new(cx)
                             .color(rgb(0xe3e3e6).into())
                             .hover(rgb(0xcfcfd1).into())
                             .active(rgb(0xe3e3e6).into())
-                            .foreground(rgb(0x4b4b4e).into()),
-                    )
+                            .foreground(rgb(0x4b4b4e).into())
+                            .apply(button, self.loading || hardware_config_disabled, cx)
+                    })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.apply_changes(window, cx);
                     })),

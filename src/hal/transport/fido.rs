@@ -62,10 +62,11 @@
 //!
 //! # Firmware compatibility
 //!
-//! Both [pico-fido] and [RS-Key] implement CTAPHID. This module handles:
-//! - Standard CTAP2 commands (GetInfo, MakeCredential, GetAssertion, etc.)
-//! - Pico-fido vendor commands (`0xC1`, `0xC2`) for hardware config
-//! - RS-Key vendor command (`0x41`) for seed backup and attestation
+//! Both [pico-fido] and [RS-Key] implement CTAPHID. This module handles standard
+//! CTAP2 framing and the RS-Key `0x41` vendor transport used by operations such
+//! as configuration reads/writes, audit, backup, soft lock, attestation, and LED
+//! management. Pico-fido `0xC1`/`0xC2` vendor commands are issued by the higher
+//! level FIDO module.
 //!
 //! # File structure
 //!
@@ -118,7 +119,8 @@ pub const CTAPHID_CBOR: u8 = 0x90;
 /// CTAPHID ERROR response byte (0xBF).
 ///
 /// Indicates the authenticator encountered an error processing the command.
-/// The next byte contains the CTAP2 error code.
+/// The next byte contains a CTAPHID transport error code (`ERR_*`), not a CTAP2
+/// command status.
 const CTAPHID_ERROR: u8 = 0xBF;
 
 /// CTAPHID KEEPALIVE status byte (0xBB).
@@ -168,83 +170,124 @@ pub struct HidTransport {
 }
 
 impl HidTransport {
-    /// Open the first available FIDO HID device and negotiate a Channel ID.
+    /// Open the active FIDO HID device and negotiate a Channel ID.
     ///
     /// Scans for a device with HID Usage Page `0xF1D0`, opens it, and performs
-    /// the CTAPHID_INIT handshake. Returns an error if no device is found or
-    /// the INIT handshake times out.
+    /// the CTAPHID_INIT handshake. Once a firmware serial is known, the HID
+    /// interface is matched to that serial instead of relying on enumeration order.
     pub fn open() -> Result<Self, PFError> {
         log::info!("Attempting to open HID transport for FIDO device...");
+        let expected_serial = super::pcsc::active_device_serial();
+        let transports = Self::open_all()?;
+        for transport in transports {
+            let Some(expected_serial) = expected_serial.as_deref() else {
+                return Ok(transport);
+            };
+            let actual_serial = crate::hal::fido::read_rskey_management_info(&transport)
+                .ok()
+                .and_then(|identity| identity.serial);
+            if actual_serial.as_deref() == Some(expected_serial) {
+                return Ok(transport);
+            }
+            log::debug!(
+                "Skipping FIDO interface with serial {:?}; active key serial is {}",
+                actual_serial,
+                expected_serial
+            );
+        }
+        if let Some(serial) = expected_serial {
+            return Err(PFError::Device(format!(
+                "The selected FIDO key (serial {serial}) is not available"
+            )));
+        }
+        Err(PFError::Device(
+            "Could not establish a FIDO HID connection".to_string(),
+        ))
+    }
+
+    /// Open every enumerated FIDO HID interface in stable path order.
+    ///
+    /// This is used during device discovery so PicoForge can identify every
+    /// supported key before choosing which one is active.
+    pub fn open_all() -> Result<Vec<Self>, PFError> {
         let api = hidapi::HidApi::new().map_err(|e| {
             log::error!("Failed to initialize HidApi: {}", e);
             PFError::Device(format!("Failed to initialize HidApi: {}", e))
         })?;
 
-        // Find device with FIDO Usage Page (0xF1D0)
-        let info = api
+        let mut infos: Vec<_> = api
             .device_list()
-            .find(|d| d.usage_page() == HID_USAGE_PAGE_FIDO)
-            .ok_or_else(|| {
-                log::warn!("No FIDO device found with Usage Page 0xF1D0.");
-                PFError::NoDevice
-            })?;
+            .filter(|info| info.usage_page() == HID_USAGE_PAGE_FIDO)
+            .collect();
+        infos.sort_by_key(|info| info.path().to_string_lossy().into_owned());
+        if infos.is_empty() {
+            log::warn!("No FIDO device found with Usage Page 0xF1D0.");
+            return Err(PFError::NoDevice);
+        }
 
-        log::debug!(
-            "Found FIDO device: VendorID=0x{:04X}, ProductID=0x{:04X}",
-            info.vendor_id(),
-            info.product_id()
-        );
+        let mut transports = Vec::with_capacity(infos.len());
+        let mut last_error = None;
+        for info in infos {
+            match Self::open_info(&api, info) {
+                Ok(transport) => transports.push(transport),
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
 
-        let vid = info.vendor_id();
-        let pid = info.product_id();
-        let release_number = info.release_number();
-        let manufacturer = info.manufacturer_string().map(|s| s.to_string());
-        let product_name = info
-            .product_string()
-            .unwrap_or("Unknown FIDO Device")
-            .to_string();
+        if transports.is_empty() {
+            Err(PFError::Device(last_error.unwrap_or_else(|| {
+                "Could not establish a FIDO HID connection".to_string()
+            })))
+        } else {
+            Ok(transports)
+        }
+    }
 
-        let device = info.open_device(&api).map_err(|e| {
-            log::error!("Failed to open HID device: {}", e);
-            PFError::Device(format!("Failed to open HID device: {}", e))
-        })?;
-
-        // Negotiate Channel ID (CID)
-        let cid = Self::init_channel(&device).map_err(|e| {
-            log::error!("Failed to negotiate Channel ID: {}", e);
-            PFError::Device(format!("Failed to negotiate Channel ID: {}", e))
-        })?;
-
-        log::info!("HID Transport established successfully. CID: 0x{:08X}", cid);
+    fn open_info(api: &hidapi::HidApi, info: &hidapi::DeviceInfo) -> Result<Self, PFError> {
+        let device = info
+            .open_device(api)
+            .map_err(|e| PFError::Device(format!("Failed to open HID device: {e}")))?;
+        let cid = Self::init_channel(&device)
+            .map_err(|e| PFError::Device(format!("Failed to negotiate Channel ID: {e}")))?;
         Ok(Self {
             device,
             cid,
-            vid,
-            pid,
-            product_name,
-            manufacturer,
-            release_number,
+            vid: info.vendor_id(),
+            pid: info.product_id(),
+            product_name: info
+                .product_string()
+                .unwrap_or("Unknown FIDO Device")
+                .to_string(),
+            manufacturer: info.manufacturer_string().map(|s| s.to_string()),
+            release_number: info.release_number(),
         })
     }
 
     /// Cheap, non-intrusive presence fingerprint of the attached FIDO HID device.
     ///
-    /// Returns `vid:pid:serial` (serial may be empty) for the first device with
-    /// the FIDO usage page, or `None` when none is present. It only *enumerates*
-    /// USB descriptors — it does not open the device or run `CTAPHID_INIT`, so it
-    /// is safe to poll on a timer even while another handle holds the device open.
-    /// A change in the returned value signals a plug / unplug / swap.
+    /// Returns a sorted fingerprint of every FIDO interface, or `None` when
+    /// none is present. It enumerates USB descriptors only, so polling is safe
+    /// while another handle is open. Set changes detect extra keys too.
     pub fn fingerprint() -> Option<String> {
         let api = hidapi::HidApi::new().ok()?;
-        let info = api
+        let mut devices: Vec<String> = api
             .device_list()
-            .find(|d| d.usage_page() == HID_USAGE_PAGE_FIDO)?;
-        Some(format!(
-            "{:04x}:{:04x}:{}",
-            info.vendor_id(),
-            info.product_id(),
-            info.serial_number().unwrap_or("")
-        ))
+            .filter(|info| info.usage_page() == HID_USAGE_PAGE_FIDO)
+            .map(|info| {
+                format!(
+                    "{:04x}:{:04x}:{}:{}",
+                    info.vendor_id(),
+                    info.product_id(),
+                    info.serial_number().unwrap_or(""),
+                    info.path().to_string_lossy()
+                )
+            })
+            .collect();
+        if devices.is_empty() {
+            return None;
+        }
+        devices.sort();
+        Some(devices.join("\n"))
     }
 
     /// Negotiate a CTAPHID Channel ID via CTAPHID_INIT.

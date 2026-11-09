@@ -2,9 +2,11 @@
 //!
 //! ```text
 //! fido/
-//! ├── mod.rs       — high-level FIDO2 operations (info, PIN, credentials, config)
-//! ├── constants.rs — CTAP2 command codes, CBOR map keys, COSE algorithms, bitflags
-//! └── ops.rs       — FidoOperations trait impl (CTAPHID framing, PIN, credential mgmt)
+//! ├── mod.rs       — high-level FIDO2 and vendor operations
+//! ├── constants.rs — CTAP2 enums and shared protocol constants
+//! ├── ops.rs       — CTAPHID framing, PIN, and credential-management operations
+//! ├── audit.rs     — audit journal parsing and checkpoint verification
+//! └── backup.rs    — seed backup payload and cryptographic helpers
 //! ```
 //!
 //! # Architecture
@@ -24,9 +26,9 @@
 //!  USB HID (CTAPHID protocol)
 //! ```
 //!
-//! [`constants`] is imported by both `mod.rs` and `ops.rs` and should be the
-//! single source of truth for every CTAP2-defined byte value. If you need to
-//! add a new command, sub-command, or CBOR key, put it there.
+//! [`constants`] contains the shared CTAP2 enums and protocol constants. Some
+//! local vendor schemas and CBOR keys remain next to the code that uses them;
+//! add reusable CTAP2 command, sub-command, or key definitions there.
 //!
 //! [`ops`] implements the [`FidoOperations`] trait on [`HidTransport`],
 //! owning the raw byte-level exchange: channel ID negotiation, packet
@@ -40,10 +42,10 @@
 //! # Vendor extensions
 //!
 //! Pico-fido firmware exposes vendor-specific CTAP commands (`0xC1`, `0xC2`)
-//! for hardware configuration (VID/PID, LED, memory stats). These are handled
-//! through [`send_vendor_config`](ops::FidoOperations::send_vendor_config) and the
-//! [`VendorConfigCommand`] enum in constants. Legacy firmware (≤7.2) uses a
-//! different physical-options encoding; see `AnyFirmware::supports_legacy_fido_hardware_config`.
+//! for hardware configuration and device details. RS-Key uses CTAPHID `0x41`
+//! for config reads/writes, audit, backup, soft lock, organization attestation,
+//! and LED operations. Pico-fido legacy hardware-config support is version- or
+//! probe-gated; RS-Key's `0x41` path is separate from that legacy path.
 //!
 //! # Adding a new FIDO2 operation
 //!
@@ -57,6 +59,9 @@
 pub mod audit;
 pub mod backup;
 pub mod constants;
+/// Third-party fapico2 firmware support (owned by the fapico2 author, not a
+/// PicoForge maintainer concern) — see the module's own header.
+pub mod fapico2;
 pub mod ops;
 use crate::hal::transport::fido::{CTAPHID_CBOR, HidTransport};
 
@@ -77,6 +82,13 @@ use ops::FidoOperations;
 
 use serde_cbor_2::{Value, from_slice, to_vec};
 use std::collections::BTreeMap;
+
+/// A supported security key discovered through its FIDO protocol identity.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SupportedKey {
+    pub serial: String,
+    pub firmware_type: FirmwareType,
+}
 
 const LEGACY_PHY_OPT_DIMMABLE: u16 = 0x02;
 const LEGACY_PHY_OPT_DISABLE_POWER_RESET: u16 = 0x04;
@@ -620,6 +632,55 @@ pub(crate) fn read_rskey_management_info(
         .ok_or_else(|| PFError::Device("Failed to read management info over FIDO".to_string()))
 }
 
+/// Discover every attached PicoFido or RS-Key and identify it by its firmware
+/// AAGUID and board-derived Management serial.
+///
+/// These protocol values distinguish the supported firmware family and pair
+/// interfaces; they are self-reported and are not cryptographic attestation.
+pub(crate) fn discover_supported_keys() -> Result<Vec<SupportedKey>, PFError> {
+    let transports = match HidTransport::open_all() {
+        Ok(transports) => transports,
+        Err(PFError::NoDevice) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+
+    let mut keys = Vec::new();
+    for transport in transports {
+        let firmware_type = match read_device_info(&transport) {
+            Ok(info) if info.aaguid == RSKEY_AAGUID => FirmwareType::RSKey,
+            Ok(info) if info.aaguid == PICOFIDO_AAGUID || info.aaguid == LKONE_AAGUID => {
+                FirmwareType::PicoFido
+            }
+            // fapico2 has its own AAGUID and speaks the RS-Key `0x41` dialect
+            // (EPIC PF-FAPICO2): a supported key like any other.
+            Ok(info) if info.aaguid == FAPICO2_AAGUID => FirmwareType::Fapico2,
+            Ok(_) => continue,
+            Err(error) => {
+                log::debug!("Skipping FIDO interface without GetInfo identity: {error}");
+                continue;
+            }
+        };
+
+        let Some(serial) = read_rskey_management_info(&transport)
+            .ok()
+            .and_then(|info| info.serial)
+            .filter(|serial| !serial.is_empty() && serial != "Unknown")
+        else {
+            log::debug!("Skipping supported FIDO key without a Management serial");
+            continue;
+        };
+
+        keys.push(SupportedKey {
+            serial,
+            firmware_type,
+        });
+    }
+
+    keys.sort_by(|left, right| left.serial.cmp(&right.serial));
+    keys.dedup_by(|left, right| left.serial == right.serial);
+    Ok(keys)
+}
+
 /// Read full device status (info, config, security flags) over the FIDO HID transport.
 ///
 /// Opens a CTAPHID channel, performs `GetInfo`, reads hardware config
@@ -677,6 +738,11 @@ pub fn read_device_details() -> Result<FullDeviceStatus, PFError> {
         // legacy 0xC1 vendor command. Always attempt it; pre-v0.3.1
         // firmware gracefully returns the config unchanged with a log.
         read_rskey_physical_config(&transport, config)
+    } else if firmware_type == FirmwareType::Fapico2 {
+        // fapico2 (third-party, see the fapico2 module header) answers the
+        // same 0x41 CONFIG_READ dialect — its own thin wrapper, so this
+        // RS-Key branch stays untouched.
+        fapico2::read_config(&transport, config)
     } else if supports_legacy_hardware_config {
         read_legacy_physical_config(&transport, config)
     } else {
@@ -1234,6 +1300,9 @@ pub fn write_config(config: AppConfigInput, pin: Option<String>) -> Result<Strin
 
     match firmware_type {
         FirmwareType::RSKey => write_rskey_config(&transport, &config, pin_val),
+        // fapico2 (third-party): its own 0x41 write path with its own strings
+        // and refusal validation — see the fapico2 module header.
+        FirmwareType::Fapico2 => fapico2::write_config(&transport, &config, pin_val),
         FirmwareType::PicoFido if firmware.supports_fido_config_write() => {
             write_legacy_hardware_config(&transport, &config, pin_val)
         }
@@ -1525,29 +1594,7 @@ fn vendor_error(status: u8, op: &str) -> String {
         0x27 => {
             "denied — no touch within the window (press the button when the LED blinks)".to_string()
         }
-        0x30 => {
-            // RS-Key's original wording covers its own 0x30 arm ("already
-            // sealed, or no OTP DEVK provisioned"). fapico2 answers 0x30 for
-            // two more reasons (EPIC PF-FAPICO2, divergences D3/D7): LOAD is
-            // reset-first — it refuses while resident credentials exist and
-            // the incoming seed differs (US-1737) — and EXPORT refuses when
-            // no master seed is installed. Split by op so the message names
-            // the reason the device refused, not a generic denial.
-            if op == "restore" {
-                format!(
-                    "{op}: operation not allowed — the board holds resident credentials \
-                     and the incoming seed differs from the installed one; \
-                     reset the device first, then restore"
-                )
-            } else if op.starts_with("export") {
-                format!(
-                    "{op}: operation not allowed — no master seed is installed; \
-                     install one first (restore / LOAD)"
-                )
-            } else {
-                format!("{op}: operation not allowed (already sealed, or no OTP DEVK provisioned)")
-            }
-        }
+        0x30 => format!("{op}: operation not allowed (already sealed, or no OTP DEVK provisioned)"),
         0x3D => "device is not locked".to_string(),
         other => format!("{op} failed: status 0x{other:02x}"),
     }
@@ -1764,7 +1811,12 @@ pub(crate) fn backup_status() -> Result<backup::BackupStatus, String> {
         .rs_key_vendor(RSKEY_VENDOR_STATE, None, None)
         .map_err(|e| e.to_string())?;
     let m = vendor_map(status, map, "state")?;
-    Ok(backup::parse_status(&m))
+    Ok(backup::BackupStatus {
+        sealed: m_bool(&m, 1),
+        has_seed: m_bool(&m, 2),
+        locked: m_bool(&m, 3),
+        unlocked: m_bool(&m, 4),
+    })
 }
 
 /// Seal the one-time export window (touch-gated).
@@ -1788,7 +1840,7 @@ pub(crate) fn backup_export(pin: Option<String>) -> Result<String, String> {
     let (status, map) = transport
         .rs_key_vendor(RSKEY_VENDOR_EXPORT, None, pin.as_deref())
         .map_err(|e| e.to_string())?;
-    let m = vendor_map(status, map, "export (already sealed?)")?;
+    let m = fapico2::vendor_map_fapico2(&transport, status, map, "export (already sealed?)")?;
     let enc = m_bytes(&m, 1).ok_or("export: missing sealed seed")?;
     let seed = backup::chacha_open(&key, &enc, &aad)?;
     let seed: [u8; 32] = seed
@@ -1815,7 +1867,10 @@ pub(crate) fn backup_restore(pin: Option<String>, mnemonic: String) -> Result<()
         .rs_key_vendor(RSKEY_VENDOR_LOAD, Some(Value::Map(params)), pin.as_deref())
         .map_err(|e| e.to_string())?;
     if status != 0 {
-        return Err(vendor_error(status, "restore"));
+        // 0x30 wording is firmware-specific (fapico2's LOAD is reset-first,
+        // D3) — resolved lazily on this error path only; RS-Key keeps the
+        // original string via the same call.
+        return Err(fapico2::backup_error(status, "restore", &transport));
     }
     Ok(())
 }
@@ -2627,33 +2682,17 @@ mod tests {
     }
 
     #[test]
-    fn restore_refusal_names_the_reset_requirement() {
-        // US-1755 (EPIC PF-FAPICO2, divergence D3): fapico2's LOAD is
-        // reset-first — under the reset-first gate it answers 0x30 while
-        // resident credentials exist and the incoming seed differs. The
-        // message must name the reset requirement, not claim "already
-        // sealed".
-        let msg = vendor_error(0x30, "restore");
-        assert!(msg.contains("reset"), "message: {msg}");
-        assert!(!msg.contains("already sealed"), "message: {msg}");
-    }
-
-    #[test]
-    fn export_refusal_names_the_missing_seed() {
-        // US-1755 (EPIC PF-FAPICO2, divergence D7): a seedless board answers
-        // EXPORT with 0x30. The message must say no master seed is installed
-        // and name installing a seed (LOAD / restore) as the remedy.
-        let msg = vendor_error(0x30, "export (already sealed?)");
-        assert!(msg.contains("no master seed"), "message: {msg}");
-        assert!(msg.contains("restore"), "message: {msg}");
-    }
-
-    #[test]
-    fn state_context_keeps_rskey_wording() {
-        // RS-Key's original 0x30 wording stays available for ops outside the
-        // backup restore/export split (e.g. STATE-context errors).
-        let msg = vendor_error(0x30, "some other op");
-        assert!(msg.contains("already sealed"), "message: {msg}");
-        assert!(msg.contains("OTP DEVK"), "message: {msg}");
+    fn vendor_error_0x30_keeps_the_original_wording_for_every_op() {
+        // Zero-regression guard (PR #131 review r4505152822): RS-Key's 0x30
+        // wording is the original generic denial for EVERY op — restore and
+        // export included. The fapico2-specific wording lives in
+        // super::fapico2::vendor_error and must never leak into this path.
+        for op in ["restore", "export (already sealed?)", "some other op"] {
+            let msg = vendor_error(0x30, op);
+            assert!(msg.contains("already sealed"), "op {op}: {msg}");
+            assert!(msg.contains("OTP DEVK"), "op {op}: {msg}");
+            assert!(!msg.contains("reset the device first"), "op {op}: {msg}");
+            assert!(!msg.contains("no master seed"), "op {op}: {msg}");
+        }
     }
 }
